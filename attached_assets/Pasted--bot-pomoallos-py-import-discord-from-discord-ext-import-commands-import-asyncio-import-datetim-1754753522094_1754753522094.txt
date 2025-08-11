@@ -1,0 +1,393 @@
+# bot_pomoallos.py
+import discord
+from discord.ext import commands
+import asyncio
+import datetime
+import os
+from typing import Optional
+
+# ---------- CONFIGURAÇÃO ----------
+TOKEN = os.getenv("DISCORD_BOT_TOKEN") or "SEU_TOKEN_AQUI"
+
+# IDs conforme solicitado
+POMODORO_VOICE_ID = 1403754766240190534    # canal de voz que ativa Pomodoro (ciclos)
+POMODORO_ANNOUNCE_CHANNEL_ID = 1403754766240190534
+
+STOPWATCH_VOICE_ID = 1403761579736043593   # canal de voz que ativa Cronômetro
+STOPWATCH_ANNOUNCE_CHANNEL_ID = 1403761579736043593
+
+# Tempo (em segundos)
+POMODORO_FOCUS = 25 * 60
+POMODORO_BREAK = 5 * 60
+MIN_SECONDS_TO_COUNT = 5 * 60  # só conta se >= 5 minutos
+
+# Intervals
+POMODORO_UPDATE_INTERVAL = 10   # atualiza a cada 10s durante Pomodoro
+STOPWATCH_UPDATE_INTERVAL = 1   # atualiza a cada 1s no cronômetro
+
+BOT_DISPLAY_NAME = "PomoAllos"
+# -----------------------------------
+
+intents = discord.Intents.default()
+intents.members = True
+intents.voice_states = True
+intents.guilds = True
+intents.messages = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# controle de sessões ativas
+user_tasks = {}   # member.id -> asyncio.Task
+user_data = {}    # member.id -> dict com info (start_time, focused_seconds, mode, message, ...)
+
+# --- utilitários ---
+def make_embed(title: str, description: str, color: int, member: Optional[discord.Member] = None, footer_text: Optional[str] = None):
+    e = discord.Embed(title=f"{BOT_DISPLAY_NAME} — {title}", description=description, color=color)
+    if member:
+        try:
+            e.set_thumbnail(url=str(member.display_avatar.url))
+        except Exception:
+            pass
+    if footer_text:
+        e.set_footer(text=footer_text)
+    return e
+
+def fmt_hms(total_seconds: int):
+    m = total_seconds // 60
+    s = total_seconds % 60
+    return f"{m}m {s}s"
+
+def get_channel_by_id(guild: discord.Guild, channel_id: int) -> Optional[discord.TextChannel]:
+    ch = guild.get_channel(channel_id)
+    if ch and isinstance(ch, discord.TextChannel):
+        return ch
+    if guild.system_channel and isinstance(guild.system_channel, discord.TextChannel):
+        return guild.system_channel
+    for c in guild.text_channels:
+        if c.permissions_for(guild.me).send_messages:
+            return c
+    return None
+
+# --- eventos ---
+@bot.event
+async def on_ready():
+    print(f"{bot.user} online — {BOT_DISPLAY_NAME} pronto!")
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # Ignora bots
+    if member.bot:
+        return
+
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
+
+    # Entrou no canal Pomodoro
+    if after_id == POMODORO_VOICE_ID and before_id != POMODORO_VOICE_ID:
+        if member.id in user_tasks:
+            await stop_session(member, reason="mudou de canal")
+        await start_pomodoro(member, after.channel)
+
+    # Saiu do canal Pomodoro
+    if before_id == POMODORO_VOICE_ID and after_id != POMODORO_VOICE_ID:
+        if member.id in user_tasks and user_data.get(member.id, {}).get("mode") == "pomodoro":
+            await stop_session(member, reason="saiu do canal")
+
+    # Entrou no canal Cronômetro (stopwatch)
+    if after_id == STOPWATCH_VOICE_ID and before_id != STOPWATCH_VOICE_ID:
+        if member.id in user_tasks:
+            await stop_session(member, reason="mudou de canal")
+        await start_stopwatch(member, after.channel)
+
+    # Saiu do canal Cronômetro
+    if before_id == STOPWATCH_VOICE_ID and after_id != STOPWATCH_VOICE_ID:
+        if member.id in user_tasks and user_data.get(member.id, {}).get("mode") == "stopwatch":
+            await stop_session(member, reason="saiu do canal")
+
+# ---------------- Pomodoro ----------------
+async def start_pomodoro(member: discord.Member, voice_channel: discord.VoiceChannel):
+    announce = get_channel_by_id(member.guild, POMODORO_ANNOUNCE_CHANNEL_ID)
+    if announce is None:
+        return
+
+    start_time = datetime.datetime.utcnow()
+    user_data[member.id] = {
+        "start_time": start_time,
+        "focused_seconds": 0,
+        "mode": "pomodoro",
+        "voice_channel": voice_channel.id,
+        "cycle_phase": "focus"  # "focus" ou "break"
+    }
+
+    # Envia a mensagem que vai ser editada (marca o usuário no conteúdo)
+    content = f"{member.mention} — Contando tempo de foco..."
+    embed = make_embed(
+        title="Foco em andamento",
+        description=f"{member.display_name} começou a focar.",
+        color=0x0055AA,  # azul enquanto foca
+        member=member,
+        footer_text="há 0 segundos"
+    )
+    try:
+        msg = await announce.send(content, embed=embed)
+    except discord.Forbidden:
+        return
+
+    user_data[member.id]["message"] = msg
+    task = asyncio.create_task(pomodoro_loop(member, announce))
+    user_tasks[member.id] = task
+
+async def pomodoro_loop(member: discord.Member, announce_channel: discord.TextChannel):
+    member_id = member.id
+    focused = 0
+    try:
+        while True:
+            # ===== FASE DE FOCO =====
+            user_data[member_id]["cycle_phase"] = "focus"
+            focus_start = datetime.datetime.utcnow()
+            phase_end = focus_start + datetime.timedelta(seconds=POMODORO_FOCUS)
+            msg = user_data[member_id].get("message")
+
+            while True:
+                now = datetime.datetime.utcnow()
+                if now >= phase_end:
+                    # ciclo completo
+                    focused += POMODORO_FOCUS
+                    user_data[member_id]["focused_seconds"] = focused
+                    break
+
+                remaining = int((phase_end - now).total_seconds())
+                elapsed_focus_partial = int((now - focus_start).total_seconds())
+
+                # Atualiza conteúdo (marca o usuário NO CONTEÚDO) e embed
+                content = f"{member.mention} — FOCO: {fmt_hms(elapsed_focus_partial)}. Faltam: {fmt_hms(remaining)}"
+                embed = make_embed(
+                    title="Foco em andamento",
+                    description=f"{member.display_name} está focando — {fmt_hms(elapsed_focus_partial)} decorrido.",
+                    color=0x0055AA,
+                    member=member,
+                    footer_text=f"Fase: foco · {fmt_hms(elapsed_focus_partial)} decorrido"
+                )
+                try:
+                    await msg.edit(content=content, embed=embed)
+                except (discord.NotFound, discord.Forbidden):
+                    # Se a mensagem foi apagada ou não for possível editar, envia uma nova
+                    msg = await announce_channel.send(content, embed=embed)
+                    user_data[member_id]["message"] = msg
+
+                # espera UPDATE_INTERVAL ou até cancelamento
+                try:
+                    await asyncio.sleep(POMODORO_UPDATE_INTERVAL)
+                except asyncio.CancelledError:
+                    # saiu durante foco -> contabiliza parcial
+                    now2 = datetime.datetime.utcnow()
+                    elapsed_partial = int((now2 - focus_start).total_seconds())
+                    focused += elapsed_partial
+                    user_data[member_id]["focused_seconds"] = focused
+                    raise
+
+            # Ao completar foco -> notifica pausa (mensagem simples com menção)
+            user_data[member_id]["focused_seconds"] = focused
+            try:
+                await announce_channel.send(f"{member.mention} — ✅ Ciclo de foco concluído. Hora de PAUSAR por {POMODORO_BREAK//60} minutos.")
+            except discord.Forbidden:
+                pass
+
+            # ===== FASE DE PAUSA =====
+            pause_start = datetime.datetime.utcnow()
+            pause_end = pause_start + datetime.timedelta(seconds=POMODORO_BREAK)
+            user_data[member_id]["cycle_phase"] = "break"
+
+            while True:
+                now = datetime.datetime.utcnow()
+                if now >= pause_end:
+                    break
+                remaining_pause = int((pause_end - now).total_seconds())
+                elapsed_pause = int((now - pause_start).total_seconds())
+
+                content = f"{member.mention} — PAUSA: {fmt_hms(elapsed_pause)} decorrido. Falta: {fmt_hms(remaining_pause)}"
+                embed = make_embed(
+                    title="Pausa em andamento",
+                    description=f"Pausa. Volta em {fmt_hms(remaining_pause)}",
+                    color=0x888888,  # cinza para pausa
+                    member=member,
+                    footer_text=f"Fase: pausa · {fmt_hms(elapsed_pause)} decorrido"
+                )
+                msg = user_data[member_id].get("message")
+                try:
+                    await msg.edit(content=content, embed=embed)
+                except (discord.NotFound, discord.Forbidden):
+                    msg = await announce_channel.send(content, embed=embed)
+                    user_data[member_id]["message"] = msg
+
+                try:
+                    await asyncio.sleep(POMODORO_UPDATE_INTERVAL)
+                except asyncio.CancelledError:
+                    # cancelado durante pausa: não contabiliza pausa
+                    raise
+
+            # pausa finalizada -> notifica retorno ao foco
+            try:
+                await announce_channel.send(f"{member.mention} — ⏰ Pausa terminou. Hora de VOLTAR ao foco!")
+            except discord.Forbidden:
+                pass
+
+            # loop continua para próximo ciclo automático
+
+    except asyncio.CancelledError:
+        # Sessão interrompida (usuário saiu do canal ou mudou)
+        end_time = datetime.datetime.utcnow()
+        total_focused = user_data.get(member_id, {}).get("focused_seconds", focused)
+
+        # se tempo de foco >= MIN_SECONDS_TO_COUNT, envia final com embed de parabéns; senão envia aviso de não contabilizado
+        if total_focused >= MIN_SECONDS_TO_COUNT:
+            content = f"{member.mention} — Sessão finalizada. Você se concentrou por {fmt_hms(total_focused)}. Parabéns! 🎉"
+            embed = make_embed(
+                title="Resumo da sessão",
+                description=f"{member.display_name} se concentrou por **{fmt_hms(total_focused)}**. Bom trabalho! 🎉",
+                color=0x22AA55,  # verde final
+                member=member,
+                footer_text="Sessão finalizada"
+            )
+            try:
+                await announce_channel.send(content, embed=embed)
+            except discord.Forbidden:
+                pass
+        else:
+            content = f"{member.mention} — Sessão finalizada. O tempo de foco foi inferior a 5 minutos, então não foi contabilizado."
+            embed = make_embed(
+                title="Sessão finalizada",
+                description=f"{member.display_name} se concentrou por **{fmt_hms(total_focused)}** (não contabilizado).",
+                color=0xCC3333,  # vermelho para não contabilizado
+                member=member,
+                footer_text="Sessão finalizada"
+            )
+            try:
+                await announce_channel.send(content, embed=embed)
+            except discord.Forbidden:
+                pass
+
+        # limpeza
+        user_tasks.pop(member_id, None)
+        user_data.pop(member_id, None)
+        return
+
+# ---------------- Cronômetro (stopwatch) ----------------
+async def start_stopwatch(member: discord.Member, voice_channel: discord.VoiceChannel):
+    announce = get_channel_by_id(member.guild, STOPWATCH_ANNOUNCE_CHANNEL_ID)
+    if announce is None:
+        return
+
+    start_time = datetime.datetime.utcnow()
+    user_data[member.id] = {
+        "start_time": start_time,
+        "mode": "stopwatch",
+        "voice_channel": voice_channel.id,
+        "elapsed_seconds": 0
+    }
+
+    # Envia a mensagem inicial (contendo a marcação do usuário). Será editada a cada segundo.
+    content = f"{member.mention} — Cronômetro iniciado: 0m 0s"
+    embed = make_embed(
+        title="Cronômetro",
+        description=f"{member.display_name} iniciou o cronômetro.",
+        color=0x0044AA,  # cor enquanto cronômetro roda
+        member=member,
+        footer_text="há 0 segundos"
+    )
+    try:
+        msg = await announce.send(content, embed=embed)
+    except discord.Forbidden:
+        return
+    user_data[member.id]["message"] = msg
+
+    task = asyncio.create_task(stopwatch_loop(member, announce))
+    user_tasks[member.id] = task
+
+async def stopwatch_loop(member: discord.Member, announce_channel: discord.TextChannel):
+    member_id = member.id
+    msg = user_data[member_id]["message"]
+    start_time = user_data[member_id]["start_time"]
+    try:
+        while True:
+            now = datetime.datetime.utcnow()
+            elapsed = int((now - start_time).total_seconds())
+            user_data[member_id]["elapsed_seconds"] = elapsed
+
+            # Conteúdo com marcação sempre
+            content = f"{member.mention} — Cronômetro: {fmt_hms(elapsed)}"
+            embed = make_embed(
+                title="Cronômetro",
+                description=f"{member.display_name} no cronômetro — {fmt_hms(elapsed)} decorrido.",
+                color=0x0044AA,
+                member=member,
+                footer_text=f"há {elapsed} segundos"
+            )
+            try:
+                await msg.edit(content=content, embed=embed)
+            except (discord.NotFound, discord.Forbidden):
+                # tenta reenviar
+                msg = await announce_channel.send(content, embed=embed)
+                user_data[member_id]["message"] = msg
+
+            try:
+                await asyncio.sleep(STOPWATCH_UPDATE_INTERVAL)
+            except asyncio.CancelledError:
+                # saindo: contabiliza último segundo
+                now2 = datetime.datetime.utcnow()
+                elapsed_final = int((now2 - start_time).total_seconds())
+                user_data[member_id]["elapsed_seconds"] = elapsed_final
+                raise
+
+    except asyncio.CancelledError:
+        total = user_data.get(member_id, {}).get("elapsed_seconds", 0)
+
+        if total >= MIN_SECONDS_TO_COUNT:
+            content = f"{member.mention} — Cronômetro finalizado. Você passou {fmt_hms(total)}. Parabéns! 🎉"
+            embed = make_embed(
+                title="Cronômetro — resumo",
+                description=f"{member.display_name} passou **{fmt_hms(total)}** no cronômetro. Bom trabalho! 🎉",
+                color=0x22AA55,
+                member=member,
+                footer_text="Sessão finalizada"
+            )
+            try:
+                await announce_channel.send(content, embed=embed)
+            except discord.Forbidden:
+                pass
+        else:
+            content = f"{member.mention} — Cronômetro finalizado. O tempo foi inferior a 5 minutos, então não foi contabilizado."
+            embed = make_embed(
+                title="Cronômetro — finalizado",
+                description=f"{member.display_name} passou **{fmt_hms(total)}** (não contabilizado).",
+                color=0xCC3333,
+                member=member,
+                footer_text="Sessão finalizada"
+            )
+            try:
+                await announce_channel.send(content, embed=embed)
+            except discord.Forbidden:
+                pass
+
+        # limpeza
+        user_tasks.pop(member_id, None)
+        user_data.pop(member_id, None)
+        return
+
+# Para parar sessão (quando usuário sai do canal)
+async def stop_session(member: discord.Member, reason: str = ""):
+    member_id = member.id
+    task = user_tasks.get(member_id)
+    if not task:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+# --- Run bot ---
+if __name__ == "__main__":
+    if TOKEN == "SEU_TOKEN_AQUI":
+        print("Defina o token do bot em DISCORD_BOT_TOKEN (variável de ambiente) ou substitua TOKEN no arquivo.")
+    bot.run(TOKEN)
